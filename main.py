@@ -1,102 +1,86 @@
 #!/usr/bin/env python3
-"""Forecast GTA VI (PS5) trophy earn rates on Exophase at a case's target.
+"""Forecast GTA VI PS5 trophy earn rates on Exophase (make.fun bounty
+gta6-trophy-rarity-forecast-01), v2 model.
 
-For every case file (*.in) in $MAKEFUN_INPUT_DIR (else /input) this writes
-<id>.out in $MAKEFUN_OUTPUT_DIR (else /output): five quantiles of each
-trophy's earn rate (percent) at the case's target instant.
+An earn rate is earners / players_tracked. Both counts only grow, but at
+different speeds, so a rate can fall (dilution by new players) or rise
+(existing players progressing). The model forecasts the two counts and
+divides.
 
-Approach, per trophy:
-  * A global fit of ln(players_tracked) against ln(1 + hours since
-    2026-11-19T00:00Z) predicts how many players Exophase will track at
-    the target.
-  * Several candidate medians are computed: persistence (last rate),
-    logit-linear trends in ln(1 + hours) and in sqrt(hours) over all reads
-    and over the last 24 hours, and an earners model that fits
-    ln(earners + 0.5) and divides by the predicted player count (so a
-    flood of new players can dilute a rate even while earners grow).
-  * Candidates are weighted by a rolling-origin validation inside the
-    case itself: fit on an early slice, score the median against the
-    last observed rate on the logit scale.
-  * The spread combines the trend fit's residual scale, a random-walk
-    term that grows with the horizon, and a count-uncertainty term that
-    is large when only a handful of players have earned the trophy.
+Players tracked: consecutive identical reads are collapsed into Exophase
+refresh epochs. A damped power law in log time is fitted to the epochs
+and blended with the most recent segment's slope; with a single epoch a
+launch-growth prior is used instead.
 
-Everything is deterministic: no randomness, no clock, no network.
+Earners per trophy: a hazard/convolution model. Players arrive over
+time (the observed epoch-to-epoch increases, then the forecast player
+path) and each arrival earns a given trophy after a random delay with a
+Weibull distribution whose scale depends on the trophy's class (story
+chapter, collectible with a large numeric target, one-off activity,
+100% completion, platinum). Expected earners are
+
+    E(t) = a + F * sum_j dP_j * G(t - t_j),
+
+where G is the delay CDF, F the eventual share of players who ever earn
+the trophy, and a captures pre-launch earners. F, a and the delay scale
+are fitted per trophy by least squares over the epochs (small grid over
+the scale). This one mechanism produces saturation of early trophies,
+slow growth of late ones and dilution of rates when new players flood
+in. The convolution median is blended in logit space with a logit-trend
+candidate and persistence, with weights from rolling-origin validation
+on the epochs. Story-chain medians are forced to respect the funnel
+order (chapter 1 >= chapter 2 >= ... >= final mission >= 100% >=
+platinum).
+
+The answering read shows the last Exophase refresh before the target,
+so the forecast is made at the target minus half the typical refresh
+gap. Quantiles are logit-normal around the median; the logit spread
+grows with the square root of the horizon and adds terms for refresh
+timing, small earner counts, player-count uncertainty and a stale page
+(a long run of identical reads means the next refresh can jump).
+
+Standard library only, deterministic, no network.
 """
 
 import json
 import math
 import os
+import re
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
-EPOCH = datetime(2026, 11, 19, tzinfo=timezone.utc)
-RATE_LO = 0.01
-RATE_HI = 99.99
-LOGIT_LO = math.log(0.0001 / 0.9999)
-LOGIT_HI = math.log(0.9999 / 0.0001)
-DAY_SECONDS = 86400.0
+LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
+Z = [-1.6448536269514722, -0.6744897501960817, 0.0,
+     0.6744897501960817, 1.6448536269514722]
 
-# spread calibration (tuned on truncated-history backtests)
-RW_COEF = 0.32        # random-walk logit sigma per sqrt(day)
-CNT_COEF = 0.35       # count-uncertainty logit sigma at one earner
-CNT_HORIZON_DAYS = 0.25  # horizon scale over which count uncertainty ramps in
-RESID_FLOOR = 0.05
-SIGMA_CAP = 1.6
+# Tuned on a synthetic launch simulator (see NOTES-v2.md).
+SIGMA_PER_SQRT_DAY = 0.26
+SIGMA_BASE = 0.10
+SIGMA_REFRESH = 0.15
+SIGMA_COUNT_COEF = 0.80
+SIGMA_COUNT_CAP = 0.42
+SIGMA_STALE_MULT = 1.35
+SIGMA_MIN = 0.07
+SIGMA_MAX = 2.20
 
+LAUNCH = datetime(2026, 11, 19, 0, 0, tzinfo=timezone.utc)
 
-# --------------------------------------------------------------------------
-# small numeric helpers
-# --------------------------------------------------------------------------
-
-def clamp(x, lo, hi):
-    return lo if x < lo else hi if x > hi else x
-
-
-def logit_of_rate(rate_pct):
-    p = clamp(rate_pct, RATE_LO, RATE_HI) / 100.0
-    return math.log(p / (1.0 - p))
-
-
-def rate_of_logit(x):
-    x = clamp(x, LOGIT_LO, LOGIT_HI)
-    if x >= 0:
-        return 100.0 / (1.0 + math.exp(-x))
-    e = math.exp(x)
-    return 100.0 * e / (1.0 + e)
-
-
-def norm_ppf(p):
-    """Inverse standard normal CDF (Acklam's rational approximation)."""
-    a = [-3.969683028665376e+01, 2.209460984245205e+02,
-         -2.759285984469534e+02, 1.383577518672690e+02,
-         -3.066479806614716e+01, 2.506628277459239e+00]
-    b = [-5.447609879822406e+01, 1.615858368580409e+02,
-         -1.556989798598866e+02, 6.680131188771972e+01,
-         -1.328068155288572e+01]
-    c = [-7.784894002430293e-03, -3.223964580411365e-01,
-         -2.400758277161838e+00, -2.549732539343734e+00,
-         4.374664141464968e+00, 2.938163982698783e+00]
-    d = [7.784695709041462e-03, 3.224671290700398e-01,
-         2.445134137142996e+00, 3.754408661907416e+00]
-    plow, phigh = 0.02425, 1.0 - 0.02425
-    if p < plow:
-        q = math.sqrt(-2.0 * math.log(p))
-        return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
-               ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
-    if p > phigh:
-        q = math.sqrt(-2.0 * math.log(1.0 - p))
-        return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
-                 ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
-    q = p - 0.5
-    r = q * q
-    return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / \
-           (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0)
+# Delay-scale prior (hours) and Weibull shape per trophy class.
+CLASS_DELAY = {
+    "first": (1.5, 1.3),
+    "chapter": (22.0, 1.05),
+    "final_story": (320.0, 1.0),
+    "completion": (700.0, 0.9),
+    "platinum": (900.0, 0.9),
+    "collectible_big": (380.0, 0.85),
+    "collectible": (160.0, 0.9),
+    "activity": (55.0, 0.95),
+}
+LAMBDA_GRID = [0.3, 0.5, 0.75, 1.0, 1.4, 2.0, 3.0, 4.5]
 
 
 def parse_time(text):
-    """Parse an ISO-8601 UTC timestamp into an aware datetime."""
-    if not isinstance(text, str):
+    if text is None:
         return None
     t = text.strip()
     if t.endswith("Z"):
@@ -110,357 +94,508 @@ def parse_time(text):
     return dt
 
 
-def hours_since_epoch(dt):
-    return (dt - EPOCH).total_seconds() / 3600.0
+def clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
 
 
-def feat_log(hours):
-    return math.log1p(max(hours, 0.0))
+def logit_pct(x):
+    p = clamp(x, 0.01, 99.99) / 100.0
+    return math.log(p / (1.0 - p))
 
 
-def feat_sqrt(hours):
-    return math.sqrt(max(hours, 0.0))
+def inv_logit_pct(v):
+    if v >= 0:
+        return 100.0 / (1.0 + math.exp(-v))
+    e = math.exp(v)
+    return 100.0 * e / (1.0 + e)
 
 
-def fit_line(xs, ys):
-    """Least-squares y = a + b*x. Returns (a, b) or None if degenerate."""
+def classify(trophy):
+    """Return (kind, eventual_share_prior, chapter_number_or_0)."""
+    desc = (trophy.get("description") or "").lower()
+    name = (trophy.get("name") or "").lower()
+    tier = (trophy.get("tier") or "").lower()
+    tid = trophy.get("id")
+
+    if tier == "platinum" or tid == 1:
+        return ("platinum", 0.055, 0)
+    if "100% completion" in desc or "100% completion" in name:
+        return ("completion", 0.085, 0)
+    m = re.search(r"chapter\s+(\d+)", desc)
+    if m:
+        n = int(m.group(1))
+        return ("chapter", clamp(0.92 - 0.085 * n, 0.35, 0.90), n)
+    if "final mission" in desc and tier == "gold":
+        return ("final_story", 0.50, 0)
+    if "gone fishing" in desc:
+        return ("first", 0.98, 0)
+    nums = [int(x) for x in re.findall(r"\d+", desc.replace(",", ""))]
+    big = max(nums) if nums else 0
+    if big >= 50 or "every" in desc or "all " in desc:
+        return ("collectible_big", 0.16, 0)
+    if big >= 3 or ("complete" in desc and "sets" in desc):
+        return ("collectible", 0.30, 0)
+    if "final mission for" in desc:
+        return ("collectible", 0.32, 0)
+    return ("activity", 0.38, 0)
+
+
+def delay_prior(kind, chapter_n):
+    lam, shape = CLASS_DELAY[kind]
+    if kind == "chapter" and chapter_n:
+        lam = 9.0 * (2.3 ** chapter_n)
+    return lam, shape
+
+
+def story_chain_rank(trophy):
+    """Position in the story funnel, or None if not on the main chain."""
+    desc = (trophy.get("description") or "").lower()
+    tier = (trophy.get("tier") or "").lower()
+    if "gone fishing" in desc:
+        return 0
+    m = re.search(r"chapter\s+(\d+)", desc)
+    if m:
+        return int(m.group(1))
+    if "final mission" in desc and tier == "gold":
+        return 50
+    if "100% completion" in desc:
+        return 60
+    if tier == "platinum":
+        return 70
+    return None
+
+
+def dedupe_epochs(history):
+    """Collapse consecutive identical reads into refresh epochs."""
+    epochs = []
+    last_key = None
+    for read in history:
+        rates = read.get("rates") or []
+        key = (read.get("players_tracked"),
+               tuple(-1.0 if r is None else float(r) for r in rates))
+        if key != last_key:
+            epochs.append(read)
+            last_key = key
+    return epochs
+
+
+def linfit(xs, ys):
     n = len(xs)
     if n < 2:
-        return None
+        return (0.0, ys[0] if ys else 0.0)
     mx = sum(xs) / n
     my = sum(ys) / n
     sxx = sum((x - mx) ** 2 for x in xs)
     if sxx <= 1e-12:
-        return None
+        return (0.0, my)
     sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
-    b = sxy / sxx
-    return (my - b * mx, b)
+    slope = sxy / sxx
+    return (slope, my - slope * mx)
 
 
-def residual_std(xs, ys, line):
-    if line is None or len(xs) < 3:
+def weibull_cdf(age, lam, shape):
+    if age <= 0:
         return 0.0
-    a, b = line
-    var = sum((y - (a + b * x)) ** 2 for x, y in zip(xs, ys)) / max(len(xs) - 2, 1)
-    return math.sqrt(var)
+    return 1.0 - math.exp(-((age / lam) ** shape))
 
 
-# --------------------------------------------------------------------------
-# case preparation
-# --------------------------------------------------------------------------
+def forecast_players(epochs, t0, t_target):
+    """Return (players_at_target, sigma_log_players, refresh_gap_hours)."""
+    times = []
+    players = []
+    for e in epochs:
+        dt = parse_time(e.get("at"))
+        p = e.get("players_tracked")
+        if dt is not None and p:
+            times.append((dt - t0).total_seconds() / 3600.0)
+            players.append(float(p))
+    if not players:
+        return (1000.0, 0.5, 3.0)
+    p_now = players[-1]
+    h_now = times[-1]
+    h_tgt = (t_target - t0).total_seconds() / 3600.0
+    horizon_h = max(h_tgt - h_now, 0.0)
 
-class Read:
-    __slots__ = ("when", "hours", "players", "rates")
+    gaps = [times[i + 1] - times[i] for i in range(len(times) - 1)
+            if times[i + 1] > times[i]]
+    gaps_sorted = sorted(gaps)
+    gap_med = gaps_sorted[len(gaps_sorted) // 2] if gaps_sorted else 3.0
+    gap_med = clamp(gap_med, 0.5, 12.0)
 
-    def __init__(self, when, hours, players, rates):
-        self.when = when
-        self.hours = hours
-        self.players = players
-        self.rates = rates
+    if len(players) >= 2 and h_now > 0.25:
+        xs = [math.log1p(h + 2.0) for h in times]
+        ys = [math.log(p) for p in players]
+        slope, intercept = linfit(xs, ys)
+        x_tgt = math.log1p(h_tgt + 2.0)
+        fit_logp = intercept + slope * x_tgt
+        if xs[-1] > xs[-2]:
+            recent = (ys[-1] - ys[-2]) / (xs[-1] - xs[-2])
+            recent = clamp(recent, 0.0, max(slope * 1.6, 0.05))
+            recent_logp = ys[-1] + 0.72 * recent * (x_tgt - xs[-1])
+            logp = 0.62 * fit_logp + 0.38 * recent_logp
+        else:
+            logp = fit_logp
+        logp = max(logp, math.log(p_now))
+        logp = min(logp, math.log(p_now)
+                   + 0.55 * math.sqrt(horizon_h / 24.0) + 0.35)
+        resid = [y - (intercept + slope * x) for x, y in zip(xs, ys)]
+        sigma = 0.10 + 0.10 * math.sqrt(horizon_h / 24.0)
+        if resid:
+            sigma += min(0.25, math.sqrt(sum(r * r for r in resid) / len(resid)))
+        return (math.exp(logp), sigma, gap_med)
 
-
-def prepare_reads(case):
-    reads = []
-    for raw in case.get("history") or []:
-        when = parse_time(raw.get("at")) or parse_time(raw.get("slot"))
-        if when is None:
-            continue
-        players = raw.get("players_tracked")
-        try:
-            players = float(players) if players is not None else None
-        except (TypeError, ValueError):
-            players = None
-        rates = raw.get("rates") or []
-        reads.append(Read(when, hours_since_epoch(when), players, rates))
-    reads.sort(key=lambda r: r.when)
-    return reads
-
-
-def fit_players(reads, x_target):
-    """Predict players_tracked at x_target from ln(players) ~ ln(1+hours)."""
-    pts = [(feat_log(r.hours), math.log(r.players))
-           for r in reads if r.players and r.players > 0]
-    if not pts:
-        return None
-    last_players = math.exp(pts[-1][1])
-    if len(pts) < 3:
-        return last_players
-    preds = []
-    line_all = fit_line([p[0] for p in pts], [p[1] for p in pts])
-    if line_all is not None:
-        preds.append(line_all[0] + line_all[1] * x_target)
-    if reads:
-        t_last = reads[-1].when.timestamp()
-        recent = [(feat_log(r.hours), math.log(r.players)) for r in reads
-                  if r.players and r.players > 0
-                  and r.when.timestamp() >= t_last - DAY_SECONDS]
-        if len(recent) >= 3:
-            line_r = fit_line([p[0] for p in recent], [p[1] for p in recent])
-            if line_r is not None:
-                preds.append(line_r[0] + line_r[1] * x_target)
-    if not preds:
-        return last_players
-    pred = math.exp(sum(preds) / len(preds))
-    # player counts do not shrink in any meaningful way; keep a sane band
-    return clamp(pred, 0.5 * last_players, 50.0 * last_players + 1000.0)
+    age_days = max((h_now + 2.0) / 24.0, 0.06)
+    gamma = 1.50 if age_days < 0.3 else 1.15 if age_days < 1.0 else 0.65
+    ratio = ((age_days + horizon_h / 24.0) / age_days) ** gamma
+    ratio = clamp(ratio, 1.0, 9.0)
+    sigma = 0.35 + 0.22 * math.sqrt(horizon_h / 24.0)
+    return (p_now * ratio, sigma, gap_med)
 
 
-# --------------------------------------------------------------------------
-# candidate medians (each returns a logit, or None when it cannot speak)
-# --------------------------------------------------------------------------
+def exposure(times, deltas, t, lam, shape):
+    """A(t) = sum_j dP_j * G(t - t_j) over arrivals at or before t."""
+    total = 0.0
+    for tj, dp in zip(times, deltas):
+        if tj <= t and dp > 0:
+            total += dp * weibull_cdf(t - tj, lam, shape)
+    return total
 
-def series_for(reads, idx):
-    """(hours, rate, players) triples where this trophy has a rate."""
+
+def fit_convolution(times, deltas, earners, lam0, shape):
+    """Grid-search the delay scale; LS for (a, F). Returns (a, F, lam)."""
+    best = None
+    for mult in LAMBDA_GRID:
+        lam = lam0 * mult
+        avals = [exposure(times, deltas, t, lam, shape) for t in times]
+        # Least squares earners ~ a + F * A with a, F >= 0.
+        slope, intercept = linfit(avals, earners)
+        if slope < 0:
+            slope, intercept = 0.0, sum(earners) / len(earners)
+        if intercept < 0:
+            intercept = 0.0
+            denom = sum(a * a for a in avals)
+            slope = (sum(a * e for a, e in zip(avals, earners)) / denom
+                     if denom > 0 else 0.0)
+            slope = max(slope, 0.0)
+        sse = sum((e - (intercept + slope * a)) ** 2
+                  for a, e in zip(avals, earners))
+        if best is None or sse < best[0]:
+            best = (sse, intercept, slope, lam)
+    return best[1], best[2], best[3]
+
+
+def future_arrivals(h_now, h_tgt, p_now, p_tgt, segments=5):
+    """Lump the forecast player growth into segments (time, dP)."""
+    if h_tgt <= h_now or p_tgt <= p_now:
+        return []
     out = []
-    for r in reads:
-        if idx < len(r.rates) and r.rates[idx] is not None:
-            try:
-                rate = float(r.rates[idx])
-            except (TypeError, ValueError):
-                continue
-            out.append((r.hours, rate, r.players))
+    x0 = math.log1p(h_now + 2.0)
+    x1 = math.log1p(h_tgt + 2.0)
+    prev_p = p_now
+    for s in range(segments):
+        frac = (s + 1) / segments
+        x = x0 + (x1 - x0) * frac
+        h = math.expm1(x) - 2.0
+        p = p_now * (p_tgt / p_now) ** frac
+        mid = h_now + (h - h_now) * 0.5 if s == 0 else (prev_h + h) * 0.5
+        out.append((mid, p - prev_p))
+        prev_p = p
+        prev_h = h
     return out
 
 
-def cand_persist(train, ctx):
-    if not train:
-        return None
-    return logit_of_rate(train[-1][1])
+def predict_conv(times, deltas, earners, lam0, shape, share_prior,
+                 all_times, all_deltas, h_tgt, e_now):
+    """Fit the convolution model and predict earners at h_tgt.
 
-
-def cand_logit_trend(train, ctx, feat, x_key, window_hours=None):
-    pts = train
-    if window_hours is not None and train:
-        t_last = train[-1][0]
-        pts = [p for p in train if p[0] >= t_last - window_hours]
-    if len(pts) < 3:
-        return None
-    xs = [feat(p[0]) for p in pts]
-    if max(xs) - min(xs) < 1e-9:
-        return None
-    ys = [logit_of_rate(p[1]) for p in pts]
-    line = fit_line(xs, ys)
-    if line is None:
-        return None
-    return line[0] + line[1] * ctx[x_key]
-
-
-def cand_earners(train, ctx, window_hours=None):
-    """Fit ln(earners + 0.5) ~ ln(1+hours); rate = earners / players."""
-    pts = [p for p in train if p[2] and p[2] > 0]
-    if window_hours is not None and pts:
-        t_last = pts[-1][0]
-        pts = [p for p in pts if p[0] >= t_last - window_hours]
-    p_t = ctx["players"]
-    if len(pts) < 3 or not p_t or p_t <= 0:
-        return None
-    xs = [feat_log(p[0]) for p in pts]
-    if max(xs) - min(xs) < 1e-9:
-        return None
-    ys = [math.log(p[1] / 100.0 * p[2] + 0.5) for p in pts]
-    line = fit_line(xs, ys)
-    if line is None:
-        return None
-    earners = math.exp(line[0] + line[1] * ctx["x_log"]) - 0.5
-    earners = clamp(earners, 0.0, p_t)
-    return logit_of_rate(100.0 * earners / p_t)
-
-
-def make_candidates():
-    """name -> function(train, ctx) -> logit or None.
-
-    ctx carries the target features: x_log, x_sqrt, players.
+    The eventual share F is shrunk toward the class prior when the
+    trophy has few earners (F and the delay scale are weakly identified
+    then), and the intercept is re-anchored so the curve passes through
+    the current earner count.
     """
-    def logit_log_all(train, ctx):
-        return cand_logit_trend(train, ctx, feat_log, "x_log")
-
-    def logit_log_24h(train, ctx):
-        return cand_logit_trend(train, ctx, feat_log, "x_log", 24.0)
-
-    def logit_sqrt_all(train, ctx):
-        return cand_logit_trend(train, ctx, feat_sqrt, "x_sqrt")
-
-    def earn_all(train, ctx):
-        return cand_earners(train, ctx)
-
-    def earn_24h(train, ctx):
-        return cand_earners(train, ctx, 24.0)
-
-    return [
-        ("persist", cand_persist),
-        ("logit_log_all", logit_log_all),
-        ("logit_log_24h", logit_log_24h),
-        ("logit_sqrt_all", logit_sqrt_all),
-        ("earn_all", earn_all),
-        ("earn_24h", earn_24h),
-    ]
+    a, fshare, lam = fit_convolution(times, deltas, earners, lam0, shape)
+    w = e_now / (e_now + 20.0)
+    fshare = w * fshare + (1.0 - w) * share_prior
+    a_now = exposure(times, deltas, times[-1], lam, shape)
+    a = clamp(e_now - fshare * a_now, 0.0, e_now)
+    a_tgt = exposure(all_times, all_deltas, h_tgt, lam, shape)
+    return a + fshare * a_tgt
 
 
-# --------------------------------------------------------------------------
-# validation weighting
-# --------------------------------------------------------------------------
-
-def validation_errors(series, candidates):
-    """Rolling-origin median errors on the logit scale, per candidate.
-
-    Fits each candidate on an early slice of the series and scores its
-    median against the last observed rate. Returns {name: mean_abs_err}
-    for candidates that could be evaluated, else {}.
-    """
-    if len(series) < 8:
-        return {}
-    t0 = series[0][0]
-    t1 = series[-1][0]
-    span = t1 - t0
-    if span < 18.0:
-        return {}
-    eval_hours, eval_rate, eval_players = series[-1]
-    y = logit_of_rate(eval_rate)
-    ctx = {
-        "x_log": feat_log(eval_hours),
-        "x_sqrt": feat_sqrt(eval_hours),
-        "players": eval_players,
-    }
-    errs = {}
-    for frac in (0.5, 0.65, 0.8):
-        cut = t0 + frac * span
-        train = [p for p in series if p[0] <= cut and p[0] < eval_hours]
-        if len(train) < 3:
-            continue
-        persist_logit = logit_of_rate(train[-1][1])
-        for name, fn in candidates:
-            try:
-                pred = fn(train, ctx)
-            except Exception:
-                pred = None
-            if pred is None or not math.isfinite(pred):
-                continue
-            pred = clamp(pred, persist_logit - 3.5, persist_logit + 3.5)
-            pred = clamp(pred, LOGIT_LO, LOGIT_HI)
-            errs.setdefault(name, []).append(abs(pred - y))
-    return {k: sum(v) / len(v) for k, v in errs.items() if v}
-
-
-# --------------------------------------------------------------------------
-# per-trophy forecast
-# --------------------------------------------------------------------------
-
-def forecast_trophy(series, ctx, days, candidates):
-    """Return (mu_logit, sigma_logit) for one trophy."""
-    if not series:
-        # Never observed: a rare trophy by default, honestly wide.
-        return logit_of_rate(0.05), 1.2
-
-    last_rate = series[-1][1]
-    persist_logit = logit_of_rate(last_rate)
-
-    preds = {}
-    for name, fn in candidates:
-        try:
-            v = fn(series, ctx)
-        except Exception:
-            v = None
-        if v is None or not math.isfinite(v):
-            continue
-        v = clamp(v, persist_logit - 3.5, persist_logit + 3.5)
-        preds[name] = clamp(v, LOGIT_LO, LOGIT_HI)
-    if "persist" not in preds:
-        preds["persist"] = persist_logit
-
-    errs = validation_errors(series, candidates)
-    weights = {}
-    if errs:
-        for name in preds:
-            e = errs.get(name)
-            weights[name] = 1.0 / (0.08 + e) ** 2 if e is not None else 0.25
-    else:
-        for name in preds:
-            weights[name] = 1.5 if name == "persist" else 1.0
-    wsum = sum(weights.values())
-    mu = sum(preds[k] * weights[k] for k in preds) / wsum
-
-    # --- spread ------------------------------------------------------------
-    xs = [feat_log(p[0]) for p in series]
-    ys = [logit_of_rate(p[1]) for p in series]
-    sigma_resid = residual_std(xs, ys, fit_line(xs, ys)) if len(series) >= 4 else 0.0
-    sigma_rw = RW_COEF * math.sqrt(max(days, 0.0))
-    last_players = series[-1][2]
-    earners_last = (last_rate / 100.0 * last_players) if last_players else 0.0
-    # count uncertainty ramps in with the horizon: over minutes the earner
-    # count barely moves, over days a handful of earners can multiply
-    hfac = math.sqrt(days / (days + CNT_HORIZON_DAYS)) if days > 0 else 0.0
-    sigma_cnt = clamp(CNT_COEF / math.sqrt(max(earners_last, 1.0)), 0.0, 0.6) * hfac
-    sigma = math.sqrt(sigma_resid ** 2 + sigma_rw ** 2 + sigma_cnt ** 2)
-    # a median that travels far from persistence is less certain
-    sigma += 0.12 * abs(mu - persist_logit)
-    sigma = clamp(sigma, RESID_FLOOR, SIGMA_CAP)
-    return mu, sigma
+def trend_median(times, rates, h_tgt):
+    """Logit rate vs ln(1+h) fit on the last 48 hours of epochs."""
+    pairs = [(t, r) for t, r in zip(times, rates) if r is not None]
+    if not pairs:
+        return 1.0
+    recent = [(t, r) for t, r in pairs if t >= pairs[-1][0] - 48.0]
+    if len(recent) >= 3:
+        pairs = recent
+    xs = [math.log1p(max(t, 0.0)) for t, _r in pairs]
+    ys = [logit_pct(r) for _t, r in pairs]
+    slope, intercept = linfit(xs, ys)
+    slope = clamp(slope, -2.5, 2.5)
+    return inv_logit_pct(intercept + slope * math.log1p(max(h_tgt, 0.0)))
 
 
 def forecast_case(case):
-    reads = prepare_reads(case)
     trophies = case.get("trophies") or []
-    levels = case.get("levels") or [0.05, 0.25, 0.5, 0.75, 0.95]
-    zs = [norm_ppf(clamp(float(p), 0.001, 0.999)) for p in levels]
+    history = case.get("history") or []
+    at = parse_time(case.get("at"))
+    target = parse_time(case.get("target"))
+    epochs = dedupe_epochs(history)
+    if not epochs:
+        epochs = history[-1:] if history else []
+    # Bound the fitting cost: thin very long epoch lists evenly, keeping
+    # the first and last epoch. Player deltas are recomputed from the
+    # kept epochs below, so arrival totals are preserved.
+    if len(epochs) > 36:
+        keep = sorted(set(
+            round(i * (len(epochs) - 1) / 35.0) for i in range(36)))
+        epochs = [epochs[i] for i in keep]
 
-    target_dt = parse_time(case.get("target"))
-    if target_dt is None:
-        horizon = float(case.get("horizon_minutes") or 0.0)
-        base = parse_time(case.get("at"))
-        if base is not None:
-            target_dt = base + timedelta(minutes=horizon)
-    if target_dt is None and reads:
-        target_dt = reads[-1].when
-    target_hours = hours_since_epoch(target_dt) if target_dt else 0.0
+    t0 = LAUNCH
+    if epochs:
+        first = parse_time(epochs[0].get("at"))
+        if first is not None and first < t0:
+            t0 = first
+    if at is None:
+        at = parse_time(epochs[-1].get("at")) if epochs else target
+    if target is None:
+        target = at
 
-    if reads and target_dt is not None:
-        days = max((target_dt - reads[-1].when).total_seconds(), 0.0) / DAY_SECONDS
-    else:
-        days = float(case.get("horizon_minutes") or 0.0) / 1440.0
+    p_target, sigma_logp, gap_med = forecast_players(epochs, t0, target)
 
-    x_log = feat_log(target_hours)
-    ctx = {
-        "x_log": x_log,
-        "x_sqrt": feat_sqrt(target_hours),
-        "players": fit_players(reads, x_log),
-    }
-    candidates = make_candidates()
+    lag_h = 0.5 * gap_med
+    horizon_h = max((target - at).total_seconds() / 3600.0 - lag_h, 0.25)
+    horizon_days = horizon_h / 24.0
+    h_now = (at - t0).total_seconds() / 3600.0
+    h_tgt = h_now + horizon_h
+
+    epoch_times = []
+    epoch_players = []
+    for e in epochs:
+        dt = parse_time(e.get("at"))
+        epoch_times.append(((dt - t0).total_seconds() / 3600.0) if dt else 0.0)
+        epoch_players.append(float(e.get("players_tracked") or 0))
+    p_now = epoch_players[-1] if epoch_players else p_target
+    if p_now <= 0:
+        p_now = max(p_target, 1.0)
+    deltas = []
+    prev = 0.0
+    for p in epoch_players:
+        deltas.append(max(p - prev, 0.0))
+        prev = p
+    fut = future_arrivals(epoch_times[-1] if epoch_times else h_now,
+                          h_tgt, p_now, p_target)
+    all_times = epoch_times + [f[0] for f in fut]
+    all_deltas = deltas + [f[1] for f in fut]
+
+    stale = False
+    if len(epochs) <= 1 and len(history) >= 3:
+        d_first = parse_time(history[0].get("at"))
+        d_last = parse_time(history[-1].get("at"))
+        if d_first and d_last:
+            stale = (d_last - d_first).total_seconds() / 3600.0 >= 1.0
+
+    # Rolling-origin origins shared by all trophies.
+    origins = []
+    if len(epochs) >= 4:
+        start = max(2, len(epochs) - 4)
+        origins = list(range(start, len(epochs) - 1))
 
     rows = []
+    medians = {}
     for idx, trophy in enumerate(trophies):
-        tid = trophy.get("id", idx + 1)
-        series = series_for(reads, idx)
-        mu, sigma = forecast_trophy(series, ctx, days, candidates)
+        kind, share_prior, chapter_n = classify(trophy)
+        lam0, shape = delay_prior(kind, chapter_n)
+
+        earners_hist = []
+        rates_hist = []
+        last_rate = None
+        for e, p in zip(epochs, epoch_players):
+            rates = e.get("rates") or []
+            r = rates[idx] if idx < len(rates) else None
+            if r is not None:
+                last_rate = float(r)
+            rates_hist.append(last_rate)
+            earners_hist.append(
+                last_rate / 100.0 * p if (last_rate is not None and p > 0)
+                else None)
+        if last_rate is None:
+            last_rate = clamp(100.0 * share_prior * 0.25, 0.05, 60.0)
+        e_now = last_rate / 100.0 * p_now
+
+        cand = {"persist": last_rate}
+
+        if len(epochs) >= 2 and all(v is not None for v in earners_hist):
+            e_conv = predict_conv(epoch_times, deltas, earners_hist,
+                                  lam0, shape, share_prior,
+                                  all_times, all_deltas, h_tgt, e_now)
+            e_conv = max(e_conv, e_now)
+            cap = share_prior * 1.6 * p_target
+            if e_conv > cap:
+                e_conv = cap + (e_conv - cap) * 0.25
+            cand["conv"] = clamp(100.0 * e_conv / p_target, 0.01, 99.99)
+            cand["trend"] = trend_median(epoch_times, rates_hist, h_tgt)
+        else:
+            # Single epoch: prior convolution from launch age.
+            age = max(h_now, 1.0)
+            gain_old = p_now * (weibull_cdf(age + horizon_h, lam0, shape)
+                                - weibull_cdf(age, lam0, shape))
+            gain_new = max(p_target - p_now, 0.0) * weibull_cdf(
+                horizon_h * 0.5, lam0, shape)
+            e_conv = e_now + share_prior * (gain_old + gain_new)
+            cand["conv"] = clamp(100.0 * e_conv / p_target, 0.01, 99.99)
+
+        # Rolling-origin validation weights (logit MAE per candidate).
+        # Each origin predicts the LAST epoch, so the weights reflect
+        # medium-horizon skill rather than one-refresh-ahead skill.
+        weights = {}
+        if origins and "conv" in cand:
+            errs = {k: [] for k in cand}
+            last_i = len(epochs) - 1
+            for oi in origins:
+                sub_t = epoch_times[:oi + 1]
+                sub_d = deltas[:oi + 1]
+                sub_e = earners_hist[:oi + 1]
+                sub_r = rates_hist[:oi + 1]
+                y = rates_hist[last_i]
+                if y is None or any(v is None for v in sub_e):
+                    continue
+                errs["persist"].append(
+                    abs(logit_pct(y) - logit_pct(sub_r[-1])))
+                try:
+                    a2, f2, lam2 = fit_convolution(
+                        sub_t, sub_d, sub_e, lam0, shape)
+                    pred_e = a2 + f2 * exposure(
+                        sub_t, sub_d, epoch_times[last_i], lam2, shape)
+                    pred_r = clamp(100.0 * pred_e / epoch_players[last_i],
+                                   0.01, 99.99)
+                    errs["conv"].append(abs(logit_pct(y) - logit_pct(pred_r)))
+                except Exception:
+                    pass
+                if "trend" in cand:
+                    pred_t = trend_median(sub_t, sub_r, epoch_times[last_i])
+                    errs["trend"].append(abs(logit_pct(y) - logit_pct(pred_t)))
+            for k in cand:
+                e = errs.get(k) or []
+                mae = sum(e) / len(e) if e else 0.30
+                weights[k] = 1.0 / (mae + 0.04) ** 2
+        if not weights:
+            if len(epochs) >= 2:
+                weights = {"persist": 0.20, "conv": 0.50, "trend": 0.30}
+            else:
+                # A refresh must happen before dilution can show up.
+                w_dil = 1.0 - math.exp(-horizon_h / 4.5)
+                weights = {"persist": 1.0 - w_dil, "conv": w_dil}
+            weights = {k: v for k, v in weights.items() if k in cand}
+        wsum = sum(weights.values()) or 1.0
+        med_logit = sum(weights[k] * logit_pct(cand[k])
+                        for k in weights) / wsum
+        median = inv_logit_pct(med_logit)
+        # A trophy already at the ceiling stays there: tracked players
+        # earn the first trophy almost immediately, and the scoring
+        # clamp makes 99.9 vs 99.0 a large logit distance.
+        if last_rate >= 99.5:
+            median = max(median, 99.9)
+        medians[trophy.get("id")] = median
+
+        refresh_scale = math.sqrt(1.0 - math.exp(-horizon_h / 4.5))
+        grow_scale = math.sqrt(1.0 - math.exp(-horizon_h / 12.0))
+        sigma = math.sqrt(
+            SIGMA_BASE ** 2
+            + (SIGMA_PER_SQRT_DAY ** 2) * horizon_days
+            + (SIGMA_REFRESH * refresh_scale) ** 2
+            + (min(SIGMA_COUNT_CAP,
+                   SIGMA_COUNT_COEF / math.sqrt(e_now + 2.0))
+               * grow_scale) ** 2
+            + (0.55 * sigma_logp * grow_scale) ** 2
+        )
+        if stale:
+            # A page that has not refreshed for hours can jump a long
+            # way at the next refresh, whatever the horizon.
+            sigma = math.sqrt(sigma ** 2 + (2.20 * refresh_scale) ** 2)
+            sigma *= SIGMA_STALE_MULT if horizon_h >= 1.0 else 1.10
+        sigma = clamp(sigma, SIGMA_MIN, SIGMA_MAX)
+
+        centre = logit_pct(median)
+        qs = [inv_logit_pct(centre + z * sigma) for z in Z]
+        rows.append({"id": trophy.get("id"), "q": qs, "_sigma": sigma})
+
+    # Funnel order on the story chain: medians non-increasing with rank.
+    chain = [(story_chain_rank(t), t.get("id")) for t in trophies]
+    chain = sorted((r, i) for r, i in chain if r is not None)
+    if len(chain) >= 2:
+        vals = [medians[i] for _, i in chain]
+        blocks = [[v] for v in vals]
+        changed = True
+        while changed:
+            changed = False
+            for j in range(len(blocks) - 1):
+                a = sum(blocks[j]) / len(blocks[j])
+                b = sum(blocks[j + 1]) / len(blocks[j + 1])
+                if a < b:
+                    blocks[j] = blocks[j] + blocks[j + 1]
+                    del blocks[j + 1]
+                    changed = True
+                    break
+        flat = []
+        for b in blocks:
+            flat.extend([sum(b) / len(b)] * len(b))
+        for (_, tid), v in zip(chain, flat):
+            medians[tid] = v
+        for row in rows:
+            if row["id"] in medians:
+                centre = logit_pct(medians[row["id"]])
+                row["q"] = [inv_logit_pct(centre + z * row["_sigma"])
+                            for z in Z]
+
+    out_rows = []
+    for row in rows:
         qs = []
-        for z in zs:
-            q = rate_of_logit(mu + z * sigma)
-            qs.append(round(clamp(q, 0.0, 100.0), 4))
-        for i in range(1, len(qs)):
-            if qs[i] < qs[i - 1]:
-                qs[i] = qs[i - 1]
-        rows.append({"id": tid, "q": qs})
-    return {"trophies": rows}
+        prev = 0.01
+        for q in row["q"]:
+            v = clamp(round(float(q), 4), 0.01, 99.99)
+            v = max(v, prev)
+            qs.append(v)
+            prev = v
+        out_rows.append({"id": row["id"], "q": qs})
+    out_rows.sort(key=lambda r: (r["id"] is None, r["id"]))
+    return {"trophies": out_rows}
 
-
-# --------------------------------------------------------------------------
-# entry point
-# --------------------------------------------------------------------------
 
 def main():
     in_dir = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
     out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
     os.makedirs(out_dir, exist_ok=True)
     try:
-        names = sorted(n for n in os.listdir(in_dir) if n.endswith(".in"))
+        names = sorted(f for f in os.listdir(in_dir) if f.endswith(".in"))
     except OSError:
         names = []
     for name in names:
-        stem = name[:-3]
-        with open(os.path.join(in_dir, name), "r", encoding="utf-8") as fh:
-            case = json.load(fh)
-        result = forecast_case(case)
-        text = json.dumps(result, separators=(",", ":"), sort_keys=False)
-        with open(os.path.join(out_dir, stem + ".out"), "w", encoding="utf-8") as fh:
+        path = os.path.join(in_dir, name)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                case = json.load(fh)
+            result = forecast_case(case)
+        except Exception:
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    case = json.load(fh)
+                hist = case.get("history") or []
+                last = (hist[-1].get("rates") if hist else []) or []
+                rows = []
+                for i, t in enumerate(case.get("trophies") or []):
+                    r = last[i] if i < len(last) and last[i] is not None else 1.0
+                    r = clamp(float(r), 0.01, 99.99)
+                    rows.append({"id": t.get("id"), "q": [r] * 5})
+                result = {"trophies": rows}
+            except Exception:
+                continue
+        cid = case.get("id") or name[:-3]
+        text = json.dumps(result, separators=(",", ":"), ensure_ascii=False)
+        with open(os.path.join(out_dir, str(cid) + ".out"), "w",
+                  encoding="utf-8") as fh:
             fh.write(text)
     return 0
 
